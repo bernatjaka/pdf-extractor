@@ -11,14 +11,14 @@ def home():
 
 @app.route('/extract-text', methods=['POST'])
 def extract_text():
-    data = request.get_json()
-    pdf_url = data.get('pdfUrl')
-    doc_id = data.get('docId')  # Optional
-
-    if not pdf_url:
-        return jsonify({'error': 'pdfUrl is required'}), 400
-
     try:
+        data = request.get_json()
+        pdf_url = data.get('pdfUrl')
+        doc_id = data.get('docId')  # Optional
+
+        if not pdf_url:
+            return jsonify({'error': 'pdfUrl is required'}), 400
+
         response = requests.get(pdf_url)
         if response.status_code != 200:
             return jsonify({'error': 'Failed to fetch PDF'}), 400
@@ -35,11 +35,10 @@ def extract_text():
                 })
 
         return jsonify({'docId': doc_id, 'pages': result})
-
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# Only run the app locally; Render will handle production startup
 if __name__ == '__main__':
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+

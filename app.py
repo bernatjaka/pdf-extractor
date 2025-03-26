@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import fitz  # PyMuPDF
 import requests
+import os
 
 app = Flask(__name__)
 
@@ -38,7 +39,7 @@ def extract_text():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# Only run the app locally; Render will handle production startup
 if __name__ == '__main__':
-    from os import getenv
-    port = int(getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)

@@ -1,9 +1,11 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS  # <-- Import CORS
 import requests
 import os
 import time
 
 app = Flask(__name__)
+CORS(app)  # <-- Enable CORS for all routes
 
 # Hardcoded PDF.co API key
 PDF_CO_API_KEY = "jakabernat3@gmail.com_hYCJ5kc8e3DfLtBiYK75gVZfwYBFBfDJRxhRcvWAlNzSFHvIfZflE5qAffPCqjla"
@@ -74,4 +76,5 @@ def extract_text():
 if __name__ == '__main__':
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 

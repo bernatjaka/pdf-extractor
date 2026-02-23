@@ -16,7 +16,7 @@ def home():
 
 @app.route('/extract-text', methods=['POST'])
 def extract_text():
-    data = request.get_json() or {}
+    data = request.get_json()
     pdf_url = data.get('pdfUrl')
     doc_id = data.get('docId')  # Optional
 
@@ -24,7 +24,7 @@ def extract_text():
         return jsonify({'error': 'pdfUrl is required'}), 400
 
     try:
-        # ✅ Create ASYNC job at PDF.co (fire)
+        # Create the asynchronous job at PDF.co
         create_job_resp = requests.post(
             "https://api.pdf.co/v1/pdf/convert/to/text",
             headers={
@@ -33,90 +33,48 @@ def extract_text():
             },
             json={
                 "url": pdf_url,
-                "async": True,
-                # ✅ Helps when source URL is flaky/expiring (Drive/Dropbox/signed URLs)
-                "cache": True
-            },
-            timeout=60
+                "async": True  # Use async mode
+            }
         )
-
         create_job_result = create_job_resp.json()
-        if (not create_job_resp.ok) or create_job_result.get("error"):
-            return jsonify({
-                'error': create_job_result.get("message", "Failed to create async job"),
-                'details': create_job_result
-            }), 400
+        if not create_job_resp.ok or create_job_result.get("error"):
+            return jsonify({'error': create_job_result.get("message", "Failed to create async job")}), 400
 
         job_id = create_job_result.get("jobId")
         result_url = create_job_result.get("url")
-        job_status = create_job_result.get("status")  # often "working"
+        job_status = create_job_result.get("status")
+        print("[extract-text] Job created with ID:", job_id)
 
-        if not job_id:
-            return jsonify({'error': 'PDF.co did not return jobId', 'details': create_job_result}), 400
-        if not result_url:
-            return jsonify({'error': 'PDF.co did not return result url', 'details': create_job_result}), 400
+        # Poll for job completion
+        MAX_POLL_SECONDS = 3000
+        POLL_INTERVAL = 10
+        start_time = time.time()
+        extracted_text = ""
 
-        print("[extract-text] Job created:", job_id, "status:", job_status)
-
-        # ✅ CHEAPER polling:
-        # - Backoff waits
-        # - Hard cap on checks (len(intervals))
-        # This prevents 45-min loops and credit burn.
-        intervals = [5, 10, 20, 40, 60, 60, 60, 60, 60, 60]  # max 10 job/check calls
-
-        for wait in intervals:
+        while time.time() - start_time < MAX_POLL_SECONDS:
             if job_status == "success":
+                print("[extract-text] Job succeeded. Fetching extracted text...")
+                result_resp = requests.get(result_url, headers={"x-api-key": PDF_CO_API_KEY})
+                extracted_text = result_resp.text
                 break
-            if job_status in ["failed", "aborted"]:
+            elif job_status in ["failed", "aborted"]:
                 return jsonify({'error': f"Async job {job_id} failed with status: {job_status}"}), 400
-
-            time.sleep(wait)
-
-            status_resp = requests.get(
-                f"https://api.pdf.co/v1/job/check?jobid={job_id}",
-                headers={"x-api-key": PDF_CO_API_KEY},
-                timeout=30
-            )
+            print(f"[extract-text] Job {job_id} status: {job_status}. Waiting {POLL_INTERVAL} seconds...")
+            time.sleep(POLL_INTERVAL)
+            status_resp = requests.get(f"https://api.pdf.co/v1/job/check?jobid={job_id}", headers={"x-api-key": PDF_CO_API_KEY})
             status_result = status_resp.json()
             job_status = status_result.get("status")
-            print(f"[extract-text] Job {job_id} status: {job_status}")
 
-        if job_status != "success":
-            # ✅ Return job info so you can inspect it (and NOT keep polling forever)
-            return jsonify({
-                'error': f"Job did not finish after {len(intervals)} checks.",
-                'docId': doc_id,
-                'jobId': job_id,
-                'lastStatus': job_status,
-                'resultUrl': result_url
-            }), 408
-
-        # ✅ Fetch extracted text
-        # NOTE: result_url is typically a signed S3 link; it usually does NOT require x-api-key
-        result_resp = requests.get(result_url, timeout=120)
-        if not result_resp.ok:
-            return jsonify({
-                'error': 'Failed to download extracted text',
-                'docId': doc_id,
-                'jobId': job_id,
-                'resultUrl': result_url
-            }), 400
-
-        extracted_text = result_resp.text or ""
-        if not extracted_text.strip():
-            return jsonify({
-                'error': 'Extracted text is empty (PDF may be scanned / needs OCR).',
-                'docId': doc_id,
-                'jobId': job_id
-            }), 400
+        if not extracted_text:
+            return jsonify({'error': f"Async job did not complete within {MAX_POLL_SECONDS} seconds."}), 400
 
         return jsonify({'docId': doc_id, 'text': extracted_text})
 
-    except requests.Timeout:
-        return jsonify({'error': 'Timed out communicating with PDF.co. Try again or use smaller PDFs.'}), 504
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
+        
 if __name__ == '__main__':
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
+

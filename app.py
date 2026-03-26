@@ -13,6 +13,22 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 EMBEDDER_URL = os.environ.get("EMBEDDER_URL", "https://embedder-document.onrender.com/embed")
 
+# Map document_type to table name and primary key column
+TABLE_CONFIG = {
+    "hoa": {
+        "table": "HOADocuments",
+        "pk": "HOADocumentID",
+    },
+    "state": {
+        "table": "StateLawDocuments",
+        "pk": "StateLawDocumentID",
+    },
+    "management": {
+        "table": "ManagementCompanyDocuments",
+        "pk": "ManagementCompanyDocumentID",
+    },
+}
+
 def supabase_headers():
     return {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
@@ -20,15 +36,22 @@ def supabase_headers():
         "Content-Type": "application/json",
     }
 
-def update_hoa_document(doc_id: str, payload: dict):
+def update_document(doc_id: str, doc_type: str, payload: dict):
     if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
-        print("[supabase] Missing env vars; cannot update HOADocuments.")
+        print("[supabase] Missing env vars; cannot update document.")
         return False
 
-    url = f"{SUPABASE_URL}/rest/v1/HOADocuments?HOADocumentID=eq.{doc_id}"
+    config = TABLE_CONFIG.get(doc_type)
+    if not config:
+        print(f"[supabase] Unknown document_type: {doc_type}")
+        return False
+
+    table = config["table"]
+    pk = config["pk"]
+    url = f"{SUPABASE_URL}/rest/v1/{table}?{pk}=eq.{doc_id}"
     resp = requests.patch(url, headers=supabase_headers(), json=payload, timeout=30)
     if not resp.ok:
-        print("[supabase] Update failed:", resp.status_code, resp.text)
+        print(f"[supabase] Update {table} failed:", resp.status_code, resp.text)
         return False
     return True
 
@@ -62,9 +85,12 @@ def pdfco_fetch_result_text(result_url: str):
         raise RuntimeError(f"Failed to fetch result file: {resp.status_code}")
     return resp.text
 
-def trigger_embedder():
+def trigger_embedder(doc_id: str = None, doc_type: str = None):
     try:
-        r = requests.post(EMBEDDER_URL, timeout=30)
+        payload = {}
+        if doc_id and doc_type:
+            payload = {"docId": doc_id, "document_type": doc_type}
+        r = requests.post(EMBEDDER_URL, json=payload, timeout=30)
         if not r.ok:
             print("[embedder] Failed:", r.status_code, r.text[:300])
         else:
@@ -72,12 +98,12 @@ def trigger_embedder():
     except Exception as e:
         print("[embedder] Error:", str(e))
 
-def background_wait_and_finalize(doc_id: str, job_id: str, result_url: str, max_wait_seconds: int = 1800):
-    print(f"[bg] Start polling job={job_id} docId={doc_id}")
+def background_wait_and_finalize(doc_id: str, doc_type: str, job_id: str, result_url: str, max_wait_seconds: int = 1800):
+    print(f"[bg] Start polling job={job_id} docId={doc_id} type={doc_type}")
     start = time.time()
     poll_interval = 10
 
-    update_hoa_document(doc_id, {
+    update_document(doc_id, doc_type, {
         "pdfco_job_id": job_id,
         "extraction_status": "working",
         "extraction_error": None,
@@ -96,24 +122,24 @@ def background_wait_and_finalize(doc_id: str, job_id: str, result_url: str, max_
             try:
                 text = pdfco_fetch_result_text(result_url)
             except Exception as e:
-                update_hoa_document(doc_id, {
+                update_document(doc_id, doc_type, {
                     "extraction_status": "failed",
                     "extraction_error": f"fetch_result_failed: {str(e)}",
                 })
                 return
 
-            ok = update_hoa_document(doc_id, {
+            ok = update_document(doc_id, doc_type, {
                 "content": text,
                 "extraction_status": "success",
                 "extraction_error": None,
             })
 
             if ok:
-                trigger_embedder()
+                trigger_embedder(doc_id, doc_type)
             return
 
         if status in ("failed", "aborted"):
-            update_hoa_document(doc_id, {
+            update_document(doc_id, doc_type, {
                 "extraction_status": "failed",
                 "extraction_error": f"pdfco_status_{status}",
             })
@@ -121,7 +147,7 @@ def background_wait_and_finalize(doc_id: str, job_id: str, result_url: str, max_
 
         time.sleep(poll_interval)
 
-    update_hoa_document(doc_id, {
+    update_document(doc_id, doc_type, {
         "extraction_status": "failed",
         "extraction_error": f"timeout_after_{max_wait_seconds}s",
     })
@@ -135,11 +161,14 @@ def extract_text():
     data = request.get_json() or {}
     pdf_url = data.get("pdfUrl")
     doc_id = data.get("docId")
+    doc_type = data.get("document_type", "hoa")  # default to "hoa" for backwards compatibility
 
     if not pdf_url or not doc_id:
         return jsonify({"error": "pdfUrl and docId are required"}), 400
     if not PDF_CO_API_KEY:
         return jsonify({"error": "Server missing PDF_CO_API_KEY"}), 500
+    if doc_type not in TABLE_CONFIG:
+        return jsonify({"error": f"Invalid document_type: {doc_type}. Must be one of: {list(TABLE_CONFIG.keys())}"}), 400
 
     try:
         job_data = pdfco_create_job(pdf_url)
@@ -151,14 +180,14 @@ def extract_text():
 
         threading.Thread(
             target=background_wait_and_finalize,
-            args=(doc_id, job_id, result_url),
+            args=(doc_id, doc_type, job_id, result_url),
             daemon=True,
         ).start()
 
-        return jsonify({"docId": doc_id, "jobId": job_id, "status": "started"}), 202
+        return jsonify({"docId": doc_id, "jobId": job_id, "document_type": doc_type, "status": "started"}), 202
 
     except Exception as e:
-        update_hoa_document(doc_id, {
+        update_document(doc_id, doc_type, {
             "extraction_status": "failed",
             "extraction_error": str(e),
         })
@@ -167,5 +196,3 @@ def extract_text():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
-

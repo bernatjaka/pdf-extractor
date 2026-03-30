@@ -3,7 +3,9 @@ from flask_cors import CORS
 import os
 import time
 import threading
+import tempfile
 import requests
+import fitz  # PyMuPDF
 
 app = Flask(__name__)
 CORS(app)
@@ -152,6 +154,34 @@ def background_wait_and_finalize(doc_id: str, doc_type: str, job_id: str, result
         "extraction_error": f"timeout_after_{max_wait_seconds}s",
     })
 
+MIN_TEXT_LENGTH = 50  # If PyMuPDF gets less than this, it's probably a scanned PDF
+
+def extract_with_pymupdf(pdf_url):
+    """Download PDF and extract text locally with PyMuPDF. Fast and free."""
+    try:
+        print(f"[PyMuPDF] Downloading PDF...")
+        resp = requests.get(pdf_url, timeout=60)
+        resp.raise_for_status()
+
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+            tmp.write(resp.content)
+            tmp_path = tmp.name
+
+        doc = fitz.open(tmp_path)
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        doc.close()
+        os.unlink(tmp_path)
+
+        text = text.strip()
+        print(f"[PyMuPDF] Extracted {len(text)} characters")
+        return text
+    except Exception as e:
+        print(f"[PyMuPDF] Error: {e}")
+        return ""
+
+
 @app.route("/")
 def home():
     return "PDF Extractor is running!"
@@ -161,14 +191,32 @@ def extract_text():
     data = request.get_json() or {}
     pdf_url = data.get("pdfUrl")
     doc_id = data.get("docId")
-    doc_type = data.get("document_type", "hoa")  # default to "hoa" for backwards compatibility
+    doc_type = data.get("document_type", "hoa")
 
     if not pdf_url or not doc_id:
         return jsonify({"error": "pdfUrl and docId are required"}), 400
-    if not PDF_CO_API_KEY:
-        return jsonify({"error": "Server missing PDF_CO_API_KEY"}), 500
     if doc_type not in TABLE_CONFIG:
         return jsonify({"error": f"Invalid document_type: {doc_type}. Must be one of: {list(TABLE_CONFIG.keys())}"}), 400
+
+    # Step 1: Try PyMuPDF first (instant, free)
+    text = extract_with_pymupdf(pdf_url)
+
+    if len(text) >= MIN_TEXT_LENGTH:
+        # PyMuPDF succeeded — save and embed immediately
+        print(f"[extract-text] PyMuPDF success: {len(text)} chars")
+        update_document(doc_id, doc_type, {
+            "content": text,
+            "extraction_status": "success",
+            "extraction_error": None,
+        })
+        trigger_embedder(doc_id, doc_type)
+        return jsonify({"docId": doc_id, "document_type": doc_type, "status": "completed", "method": "pymupdf", "characters": len(text)})
+
+    # Step 2: PyMuPDF didn't get enough text — fall back to PDF.co OCR
+    print(f"[extract-text] PyMuPDF got only {len(text)} chars, falling back to PDF.co OCR...")
+
+    if not PDF_CO_API_KEY:
+        return jsonify({"error": "PyMuPDF failed and no PDF_CO_API_KEY configured"}), 500
 
     try:
         job_data = pdfco_create_job(pdf_url)
@@ -184,7 +232,7 @@ def extract_text():
             daemon=True,
         ).start()
 
-        return jsonify({"docId": doc_id, "jobId": job_id, "document_type": doc_type, "status": "started"}), 202
+        return jsonify({"docId": doc_id, "jobId": job_id, "document_type": doc_type, "status": "started", "method": "pdfco_ocr"}), 202
 
     except Exception as e:
         update_document(doc_id, doc_type, {
